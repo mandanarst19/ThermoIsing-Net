@@ -1,0 +1,55 @@
+# CITATION.cff
+
+
+cff-version: 1.2.0
+
+title: "ThermoIsing-Net"
+
+message: >
+  If you use this software in your research, please cite it using the
+  metadata below.
+
+type: software
+
+authors:
+  - family-names: "[Roosta]"
+    given-names:  "[Mandana]"
+    affiliation:  "[Physics Department,Shahid Beheshti University]"
+    email:        "[mandanaroosta.academia@gmail.com]"
+
+  #  co-authors :
+  # - family-names: "[Jafari]"
+  #   given-names:  "[Reza]"
+     # affiliation:  "[Physics Department,Shahid Beheshti University]"
+   # email:        "[gjafari@gmail.com]"
+
+  #  co-authors :
+  # - family-names: "[Mohseni]"
+  #   given-names:  "[Majid]"
+   #affiliation:  "[Physics Department,Shahid Beheshti University]"
+   # email:        "[majidmohseni@gmail.com]"
+
+repository-code: "https://github.com/mandanarst19/ThermoIsing-Net"
+
+abstract: >
+  Simulation code for a 5×5 thermal VO₂ neuristor network that performs
+  unsupervised feature extraction via Hebbian learning and achieves 53%
+  accuracy on MNIST digit classification using physical thermal dynamics
+  as the computational substrate.
+
+keywords:
+  - neuromorphic computing
+  - vanadium dioxide
+  - phase-change materials
+  - Hebbian learning
+  - reservoir computing
+  - insulator-to-metal transition
+  - spiking neural networks
+  - thermal neuristor
+
+license: MIT
+
+version: "1.0.0"
+
+date-released: "[2026/04/27]"
+
