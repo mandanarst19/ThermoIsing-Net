@@ -1,0 +1,27 @@
+# requirements.txt
+# ─────────────────────────────────────────────────────────────────────────────
+# Thermal VO₂ Neuristor Network — Pinned dependencies
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# Tested on Python 3.9, 3.10, 3.11 (Linux / macOS / Windows)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Core scientific stack
+numpy>=1.24,<2.0
+scipy>=1.11,<2.0
+
+# Machine learning / preprocessing
+scikit-learn>=1.3,<2.0
+
+# Plotting
+matplotlib>=3.7,<4.0
+
+# Notebook support (optional but recommended)
+jupyterlab>=4.0
+ipykernel>=6.0
+
+# Reproducibility / serialisation
+# (pickle is stdlib; listed here for documentation)
+# pickle — Python stdlib, no install needed
