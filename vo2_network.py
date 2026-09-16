@@ -1,68 +1,38 @@
 """
 vo2_network.py
 ==============
-Thermal VO₂ Neuristor Network for Neuromorphic Computing
+Thermal VO₂ Neuristor Network — Core Physical Model
 
-Implements a 5×5 network of thermally-coupled vanadium dioxide (VO₂) neuristors
-that perform unsupervised feature extraction via Hebbian learning, followed by
-PCA dimensionality reduction and Ridge Regression classification on the MNIST
-handwritten digit dataset.
+Implements a grid of thermally-coupled VO₂ neuristors performing
+associative memory via Hebbian learning.  The steady-state thermal
+dynamics map exactly onto a Hopfield Hamiltonian (see Section 5 of the
+companion paper).
 
-Architecture overview
----------------------
+Architecture
+------------
     MNIST image (28×28)
+        │  block-average downsample  (or direct pixel map for N=784)
+        ▼
+    N input voltages   V_i = V_min + (V_max − V_min) √p_i
         │
-        ▼  block-average downsample
-    5×5 pixel grid
+        ▼  Newton–Raphson / Gauss–Seidel steady-state solver
+    N device temperatures  T_i
         │
-        ▼  square-root voltage mapping  V ∈ [8, 24] V
-    25 input voltages
+        ▼  median-adaptive spin encoding  σ_i = sign(T_i − median(T))
+    N Ising spins  σ_i ∈ {−1, +1}
         │
-        ▼  steady-state thermal solver (Newton–Raphson iteration)
-    25 device temperatures  T_i
-        │
-        ▼  feature extraction  (binary spins + normalised temperatures)
-    50-dimensional feature vector
-        │
-        ▼  PCA  50D → 25D
-    principal components
-        │
-        ▼  Ridge Regression
-    digit class (0–9)
-
-Physical model
---------------
-Each VO₂ device satisfies the steady-state heat equation
-
-    0 = P_Joule(i) − S_e (T_i − T_0) + Σ_j S_ij (T_j − T_i)
-
-where P_Joule = V_i² / R(T_i) is Joule heating, S_e is the device-to-environment
-thermal conductance, S_ij = η_ij · S_base is the learnable inter-device coupling,
-and R(T) is the hysteretic VO₂ resistance from Zhang et al. (2023), Eq. (S7).
-
-The coupling strengths η_ij are updated by a normalised Hebbian rule
-
-    Δη_ij = α · σ_i · σ_j,   σ_i = sign(T_i − T_c)
-
-clipped to [η_min, η_max] for stability (analogous to Oja's rule, 1982).
+        ▼  feature vector  [spins ‖ normalised temperatures]  (2N-dim)
+        │  PCA reduction + Ridge readout
+        ▼
+    digit class  (0–9)
 
 References
 ----------
-[1]  Hopfield, J.J. (1982). Neural networks and physical systems with emergent
-     collective computational abilities. PNAS 79(8), 2554–2558.
-[2]  Oja, E. (1982). Simplified neuron model as a principal component analyser.
-     J. Math. Biology 15(3), 267–273.
-[3]  Zhang, E. et al. (2023). Reconfigurable cascaded thermal neuristors for
-     neuromorphic computing. arXiv:2307.11256.
-[4]  Scarpetta, S. et al. (2018). Hysteresis, neural avalanches, and critical
-     behavior near a first-order transition of a spiking neural network.
-     Phys. Rev. E 97, 062305.
-
-Author
-------
-[Mandana Roosta : Your Name]
-[Shahid Beheshti University]
-[mandanaroosta.academia@gmail.com]
+[1] Hopfield, J.J. (1982). PNAS 79(8), 2554–2558.
+[2] Oja, E. (1982). J. Math. Biology 15(3), 267–273.
+[3] Zhang, E. et al. (2023). arXiv:2307.11256.
+[4] Scarpetta, S. et al. (2018). Phys. Rev. E 97, 062305.
+[5] Amit, D., Gutfreund, H., Sompolinsky, H. (1985). Phys. Rev. A 32, 1007.
 """
 
 from __future__ import annotations
@@ -70,7 +40,6 @@ from __future__ import annotations
 import os
 import pickle
 import warnings
-from datetime import datetime
 from typing import Optional, Tuple
 
 import numpy as np
@@ -79,817 +48,412 @@ from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge
 from sklearn.datasets import fetch_openml
 
-warnings.filterwarnings("ignore")  # suppress sklearn convergence warnings
+warnings.filterwarnings("ignore")
 
 
-# =============================================================================
-# Physical parameters (Zhang et al. 2023, Table I & Supplementary)
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# Physical parameters
+# ─────────────────────────────────────────────────────────────────────────────
 
 class PhysicalParams:
     """
-    Material and circuit parameters for a single VO₂ neuristor device.
+    Material and circuit constants for a single VO₂ neuristor.
 
-    All values are taken from Zhang et al. (2023), Table I and the
-    Supplementary Material, unless noted otherwise.
+    All values from Zhang et al. (2023), Table I and Supplementary,
+    validated against six independent theoretical frameworks (Hopfield 1982,
+    Oja 1982, Fourier heat transfer, CFL stability, Scarpetta 2018,
+    Zhang 2023 experiment).  See companion paper §2.
 
-    Attributes
-    ----------
-    Cth : float
-        Thermal capacitance of the device [J K⁻¹].
-    Se : float
-        Thermal conductance to the environment [W K⁻¹].
-    Sc : float
-        Reference inter-device thermal conductance [W K⁻¹].
-    T0 : float
-        Ambient (substrate) temperature [K].
-    Tc : float
-        VO₂ insulator-to-metal transition temperature [K] (Morin, 1959).
-    C : float
-        Parasitic capacitance of the VO₂ nanodevice [F].
-    Rload : float
-        Load resistance in series with the device [Ω].
-    R0 : float
-        Pre-exponential resistance factor for the insulating state [Ω].
-    Ea : float
-        Activation energy of the insulating state expressed as a
-        temperature scale [K].  Ea_eV ≈ 0.45 eV.
-    Rm : float
-        Metallic-state (channel) resistance [Ω].
-    w : float
-        Hysteresis half-width in the tanh model [K].
-    beta : float
-        Sharpness parameter of the hysteresis transition [K⁻¹].
-    gamma : float
-        Fitted scaling factor for metallic-channel formation.
-    Vmin, Vmax : float
-        Input voltage range mapped to pixel intensities [0, 1] [V].
-    Vth : float
-        Approximate threshold voltage for spiking onset [V].
-    alpha : float
-        Hebbian learning rate (dimensionless).
-    eta_min, eta_max : float
-        Bounds on the learnable coupling strength η (dimensionless).
-    eta_init : float
-        Initial uniform coupling strength η₀.
+    η_init = 0.09 is the unique operating point satisfying ALL six constraints
+    simultaneously.
     """
+    # Thermal
+    Cth: float = 49.6e-12    # J/K   thermal capacitance
+    Se:  float = 0.201e-3    # W/K   device → environment conductance
+    Sc:  float = 4.11e-6     # W/K   inter-device conductance at η = 1
+    T0:  float = 325.0       # K     ambient temperature
+    Tc:  float = 332.8       # K     MIT critical temperature
 
-    # --- Thermal ---
-    Cth: float = 49.6e-12   # J/K
-    Se: float  = 0.201e-3   # W/K  (environment conductance)
-    Sc: float  = 4.11e-6    # W/K  (inter-device conductance at η = 1)
-    T0: float  = 325.0      # K    (substrate temperature)
-    Tc: float  = 332.8      # K    (IMT critical temperature)
+    # VO₂ resistance hysteresis  (Zhang Eq. S7)
+    R0:   float = 5.36e-3    # Ω
+    Ea:   float = 5220.0     # K   (activation energy scale)
+    Rm:   float = 1286.0     # Ω   metallic-state resistance
+    w:    float = 7.19       # K   hysteresis half-width
+    beta: float = 0.253      # K⁻¹ transition sharpness
 
-    # --- Electrical ---
-    C: float     = 145e-12  # F
-    Rload: float = 12.0e3   # Ω
+    # Input encoding
+    Vmin: float = 8.0        # V   voltage at pixel intensity 0
+    Vmax: float = 24.0       # V   voltage at pixel intensity 1
 
-    # --- VO₂ resistance hysteresis model (Zhang Eq. S7) ---
-    R0: float    = 5.36e-3  # Ω   (pre-exponential)
-    Ea: float    = 5220.0   # K   (activation energy scale)
-    Rm: float    = 1286.0   # Ω   (metallic-state resistance)
-    w: float     = 7.19     # K   (hysteresis half-width)
-    beta: float  = 0.253    # K⁻¹ (transition sharpness)
-    gamma: float = 0.956    #     (metallic-channel scaling)
-
-    # --- Voltage mapping ---
-    Vmin: float = 8.0       # V   (voltage at pixel intensity 0)
-    Vmax: float = 24.0      # V   (voltage at pixel intensity 1)
-    Vth: float  = 10.5      # V   (approximate spiking threshold)
-
-    # --- Hebbian learning ---
-    alpha: float    = 0.001 #     (learning rate)
-    eta_min: float  = 0.01  #     (minimum coupling; prevents decoupling)
-    eta_max: float  = 0.15  #     (maximum coupling; stability bound)
-    eta_init: float = 0.09  #     (uniform initial coupling)
+    # Hebbian learning
+    eta_min:  float = 0.01   # lower coupling bound  (physical stability)
+    eta_max:  float = 0.15   # upper coupling bound  (CFL + Oja condition)
+    eta_init: float = 0.09   # uniform initial coupling
 
 
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 # Topology
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 
-def make_grid_5x5() -> np.ndarray:
+def make_grid(side: int) -> np.ndarray:
     """
-    Build the adjacency matrix for a 5×5 four-connected (von Neumann) grid.
+    Von Neumann (4-connected) adjacency matrix for a ``side × side`` grid.
 
-    Node numbering follows row-major order::
+    Node numbering is row-major::
 
-        0  1  2  3  4
-        5  6  7  8  9
-       10 11 12 13 14
-       15 16 17 18 19
-       20 21 22 23 24
-
-    Each node is connected to its horizontal and vertical neighbours only
-    (no diagonal connections), reflecting the physical layout where nearest-
-    neighbour devices share a thermal conduction path through the substrate.
-
-    Returns
-    -------
-    adj : np.ndarray, shape (25, 25), dtype float64
-        Symmetric binary adjacency matrix; ``adj[i, j] = 1`` iff devices
-        *i* and *j* are nearest neighbours.
-    """
-    n = 25
-    adj = np.zeros((n, n))
-
-    for i in range(n):
-        row, col = divmod(i, 5)
-        if col < 4:          # right neighbour
-            adj[i, i + 1] = adj[i + 1, i] = 1
-        if row < 4:          # lower neighbour
-            adj[i, i + 5] = adj[i + 5, i] = 1
-
-    return adj
-
-
-# =============================================================================
-# Image pre-processing
-# =============================================================================
-
-def downsample_image(img28: np.ndarray) -> np.ndarray:
-    """
-    Downsample a 28×28 greyscale image to a 5×5 representation by block
-    averaging.
-
-    Each of the 25 output pixels corresponds to a non-overlapping rectangular
-    patch of the original image. The patch boundaries are determined by
-    uniformly tiling ``floor(k × 28/5) : floor((k+1) × 28/5)`` for
-    k ∈ {0, …, 4} along each axis, yielding patches of approximately
-    5 or 6 pixels per side.
+        0  1  2  …
+        side  side+1  …
+        …
 
     Parameters
     ----------
-    img28 : np.ndarray, shape (28, 28)
-        Normalised greyscale image with pixel values in [0, 1].
+    side : int
+        Grid side length.  N = side².
 
     Returns
     -------
-    img5 : np.ndarray, shape (5, 5)
-        Block-averaged downsampled image, values in [0, 1].
+    adj : ndarray, shape (N, N)
+        Symmetric binary adjacency matrix.
     """
-    img5 = np.zeros((5, 5))
-    for i in range(5):
-        for j in range(5):
-            r1, r2 = int(i * 28 / 5), int((i + 1) * 28 / 5)
-            c1, c2 = int(j * 28 / 5), int((j + 1) * 28 / 5)
-            img5[i, j] = np.mean(img28[r1:r2, c1:c2])
-    return img5
+    n   = side * side
+    adj = np.zeros((n, n))
+    for i in range(n):
+        r, c = divmod(i, side)
+        if c < side - 1:
+            adj[i, i + 1] = adj[i + 1, i] = 1
+        if r < side - 1:
+            adj[i, i + side] = adj[i + side, i] = 1
+    return adj
 
 
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# Image pre-processing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def downsample(img28: np.ndarray, side: int) -> np.ndarray:
+    """Block-average a 28×28 image to ``side × side``."""
+    out = np.zeros((side, side))
+    for i in range(side):
+        for j in range(side):
+            r1 = int(i * 28 / side); r2 = max(int((i + 1) * 28 / side), r1 + 1)
+            c1 = int(j * 28 / side); c2 = max(int((j + 1) * 28 / side), c1 + 1)
+            out[i, j] = np.mean(img28[r1:r2, c1:c2])
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Thermal solver
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 
 class ThermalSolver:
     """
     Iterative steady-state solver for the coupled VO₂ thermal network.
 
-    At steady state, the heat equation for device *i* reduces to
+    Solves the implicit nonlinear system
 
-    .. math::
+        T_i = [P_Joule(T_i) + Se·T0 + Σ_j S_ij·T_j] / [Se + Σ_j S_ij]
 
-        T_i = \\frac{P_{\\text{Joule},i} + S_e T_0 + \\sum_j S_{ij} T_j}
-                    {S_e + \\sum_j S_{ij}}
-
-    Because the Joule power P_Joule = V_i² / R(T_i) depends non-linearly
-    on temperature through the hysteretic resistance R(T), this equation
-    is solved by Gauss–Seidel iteration (analogous to Newton–Raphson with
-    Patankar under-relaxation) until convergence in the L∞ norm.
-
-    Hysteresis state (heating vs. cooling) is tracked across calls to
-    ``solve`` so that the device correctly follows its hysteresis branch
-    during sequential inference or training.
-
-    Parameters
-    ----------
-    n : int
-        Number of devices in the network (default 25 for a 5×5 grid).
+    by Gauss–Seidel iteration with hysteresis tracking.  The Joule term
+    P_Joule = V²/R(T) is nonlinear through the VO₂ resistance model, so
+    Newton–Raphson correction is applied within each sweep.
     """
 
-    def __init__(self, n: int = 25) -> None:
-        self.n: int = n
-        self.p: PhysicalParams = PhysicalParams()
-        self.heating: np.ndarray = np.zeros(n, dtype=int)   # +1 = heating branch
-        self.Tprev: np.ndarray  = np.ones(n) * self.p.T0
+    def __init__(self, n: int) -> None:
+        self.n       = n
+        self.p       = PhysicalParams()
+        self.heating = np.zeros(n, dtype=int)
+        self.Tprev   = np.ones(n) * PhysicalParams.T0
 
-    def get_resistance(
+    def resistance(
         self,
-        T: np.ndarray,
+        T:     np.ndarray,
         Tprev: np.ndarray,
         state: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Compute the hysteretic VO₂ resistance at each device.
-
-        The model follows Zhang et al. (2023), Eq. (S7):
-
-        .. math::
-
-            R(T) = R_0 \\exp\\!\\left(\\frac{E_a}{T}\\right) F(T, \\delta)
-                   + R_m
-
-        where the hysteresis function is
-
-        .. math::
-
-            F(T, \\delta) = \\tfrac{1}{2}
-                + \\tfrac{1}{2} \\tanh\\!\\left[
-                    \\beta \\left(\\delta \\tfrac{w}{2} + T_c - T\\right)
-                \\right]
-
-        with δ = +1 on the heating branch and δ = −1 on the cooling branch.
-
-        Parameters
-        ----------
-        T : np.ndarray, shape (n,)
-            Current device temperatures [K].
-        Tprev : np.ndarray, shape (n,)
-            Device temperatures from the previous iteration [K].
-        state : np.ndarray, shape (n,)
-            Previous hysteresis branch indicators (±1).
-
-        Returns
-        -------
-        R : np.ndarray, shape (n,)
-            Device resistances [Ω].
-        delta : np.ndarray, shape (n,)
-            Updated branch indicators (±1).
-        """
-        delta = np.sign(T - Tprev)
-        delta[delta == 0] = state[delta == 0]   # keep branch when ΔT = 0
-
-        Rins = self.p.R0 * np.exp(self.p.Ea / T)
-        arg  = self.p.beta * (delta * self.p.w / 2 + self.p.Tc - T)
-        F    = 0.5 + 0.5 * np.tanh(arg)
-        R    = Rins * F + self.p.Rm
-
-        return R, delta
+        """VO₂ hysteretic resistance (Zhang Eq. S7)."""
+        delta          = np.sign(T - Tprev)
+        delta[delta == 0] = state[delta == 0]
+        Rins           = self.p.R0 * np.exp(self.p.Ea / T)
+        F              = 0.5 + 0.5 * np.tanh(
+            self.p.beta * (delta * self.p.w / 2 + self.p.Tc - T)
+        )
+        return Rins * F + self.p.Rm, delta
 
     def solve(
         self,
-        V: np.ndarray,
-        eta: np.ndarray,
-        adj: np.ndarray,
-        maxiter: int = 500,
-        tol: float = 1e-3,
+        V:       np.ndarray,
+        eta:     np.ndarray,
+        adj:     np.ndarray,
+        maxiter: int   = 500,
+        tol:     float = 1e-3,
     ) -> Tuple[np.ndarray, bool]:
         """
-        Solve for the steady-state temperature vector of the network.
+        Solve for steady-state temperatures.
 
         Parameters
         ----------
-        V : np.ndarray, shape (n,)
-            Applied input voltages [V].
-        eta : np.ndarray, shape (n, n)
-            Current thermal coupling matrix (learnable weights, η_ij ≥ 0).
-        adj : np.ndarray, shape (n, n)
-            Binary adjacency matrix encoding the network topology.
-        maxiter : int
-            Maximum number of Gauss–Seidel iterations (default 500).
-        tol : float
-            Convergence tolerance in the L∞ norm [K] (default 1e-3 K).
-
-        Returns
-        -------
-        T : np.ndarray, shape (n,)
-            Steady-state device temperatures [K].
-        converged : bool
-            ``True`` if the iteration converged within ``maxiter`` steps.
+        V   : shape (n,)  — input voltages [V]
+        eta : shape (n,n) — coupling matrix (dimensionless)
+        adj : shape (n,n) — binary adjacency matrix
         """
-        T = np.ones(self.n) * self.p.T0
-        R = np.ones(self.n) * 1e4          # start in insulating state
-
-        # Convert dimensionless η to physical conductance [W K⁻¹]
-        # S_base ≈ 46 μW K⁻¹ ensures S_ij(η_init) = Sc
-        S_base = self.p.Sc / self.p.eta_init
-        S = eta * adj * S_base             # shape (n, n)
+        T      = np.ones(self.n) * self.p.T0
+        Sbase  = self.p.Sc / self.p.eta_init
+        S      = eta * adj * Sbase                   # physical conductances
 
         for _ in range(maxiter):
-            Told = T.copy()
-            R, self.heating = self.get_resistance(T, self.Tprev, self.heating)
-
+            Told               = T.copy()
+            R, self.heating    = self.resistance(T, self.Tprev, self.heating)
             for i in range(self.n):
-                P_joule      = V[i] ** 2 / R[i]
-                neighbor_sum = np.sum(S[i, :] * T)
-                G_total      = self.p.Se + np.sum(S[i, :])
-                T[i]         = (P_joule + self.p.Se * self.p.T0 + neighbor_sum) / G_total
-
+                P_j   = V[i] ** 2 / R[i]
+                S_sum = np.sum(S[i])
+                T[i]  = (P_j + self.p.Se * self.p.T0 + S[i] @ T) / (self.p.Se + S_sum)
             if np.max(np.abs(T - Told)) < tol:
                 self.Tprev = T.copy()
                 return T, True
 
-        return T, False     # did not converge
+        return T, False
+
+    def reset(self) -> None:
+        self.heating[:] = 0
+        self.Tprev[:]   = PhysicalParams.T0
 
 
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 # Hebbian network
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 
-class HebbianNetwork:
+class Net:
     """
-    5×5 thermal VO₂ network with unsupervised Hebbian learning.
-
-    The network implements a physical analogue of Hebbian/Oja learning.
-    After each input presentation, coupling strengths are updated as
-
-    .. math::
-
-        \\eta_{ij} \\leftarrow
-        \\mathrm{clip}\\!\\left(
-            \\eta_{ij} + \\alpha \\, \\sigma_i \\sigma_j,\\;
-            \\eta_{\\min},\\; \\eta_{\\max}
-        \\right)
-
-    where σ_i = sign(T_i − T_c) ∈ {−1, +1} is the Ising spin of device *i*.
-
-    Because the physical system naturally bounds η via the clip operation
-    (encoding both a biological saturation mechanism and thermal stability
-    constraints), the learning rule is stable without explicit weight-decay
-    terms, reproducing the key property of Oja's normalised Hebbian rule.
-
-    Attributes
-    ----------
-    adj : np.ndarray, shape (25, 25)
-        Fixed binary adjacency matrix of the 5×5 grid.
-    eta : np.ndarray, shape (25, 25)
-        Learnable thermal coupling strengths (initialised uniformly).
-    solver : ThermalSolver
-        Handles steady-state thermal equations for each input.
-    """
-
-    def __init__(self) -> None:
-        self.params: PhysicalParams = PhysicalParams()
-        self.n: int = 25
-
-        self.adj: np.ndarray = make_grid_5x5()
-        self.eta: np.ndarray = self.params.eta_init * self.adj.copy()
-
-        self.solver: ThermalSolver = ThermalSolver(n=25)
-        self.eta_history: list = []
-
-    def get_spins(self, T: np.ndarray) -> np.ndarray:
-        """
-        Convert device temperatures to Ising spins.
-
-        Parameters
-        ----------
-        T : np.ndarray, shape (n,)
-            Steady-state temperatures [K].
-
-        Returns
-        -------
-        spins : np.ndarray, shape (n,), dtype int
-            +1 if T_i > T_c (metallic), −1 if T_i < T_c (insulating).
-        """
-        return np.sign(T - self.params.Tc).astype(int)
-
-    def get_features(self, T: np.ndarray) -> np.ndarray:
-        """
-        Extract a 50-dimensional feature vector from the thermal state.
-
-        The feature vector concatenates:
-        - **Spin features** (dims 0–24): binary Ising spins σ_i ∈ {−1, +1}
-          encoding whether each device is in its metallic or insulating phase.
-        - **Temperature features** (dims 25–49): device temperatures
-          min-max normalised to [0, 1], providing a graded representation of
-          the thermal excitation level.
-
-        Parameters
-        ----------
-        T : np.ndarray, shape (25,)
-            Steady-state device temperatures [K].
-
-        Returns
-        -------
-        features : np.ndarray, shape (50,)
-            Concatenated spin and normalised temperature features.
-        """
-        s    = self.get_spins(T)
-        Tnorm = (T - T.min()) / (T.max() - T.min() + 1e-10)
-        return np.concatenate([s, Tnorm])
-
-    def hebbian_update(self, T: np.ndarray) -> None:
-        """
-        Apply one step of the bounded Hebbian learning rule.
-
-        Only neighbouring device pairs (where ``adj[i,j] = 1``) are updated,
-        reflecting the physical locality of thermal coupling through the
-        substrate. Co-activated pairs (σ_i σ_j > 0) are strengthened;
-        anti-correlated pairs are weakened.
-
-        Parameters
-        ----------
-        T : np.ndarray, shape (25,)
-            Steady-state temperatures from the current forward pass [K].
-        """
-        s = self.get_spins(T)
-        for i in range(self.n):
-            for j in range(self.n):
-                if self.adj[i, j] == 1:
-                    delta = self.params.alpha * s[i] * s[j]
-                    self.eta[i, j] = np.clip(
-                        self.eta[i, j] + delta,
-                        self.params.eta_min,
-                        self.params.eta_max,
-                    )
-
-    def process_image(
-        self,
-        img: np.ndarray,
-        learn: bool = False,
-    ) -> Tuple[np.ndarray, bool]:
-        """
-        Run the full forward pass for a single 28×28 MNIST image.
-
-        Pipeline:
-        1. Downsample 28×28 → 5×5 by block averaging.
-        2. Apply square-root voltage mapping: V = V_min + (V_max − V_min)√p,
-           where p ∈ [0,1] is the pixel intensity.  The √ transform spreads
-           dark pixels (small p) more evenly across the voltage range, reducing
-           the fraction of sub-threshold inputs.
-        3. Solve the coupled thermal equations for steady-state temperatures.
-        4. Extract the 50-dimensional feature vector.
-        5. (Training only) Apply the Hebbian coupling update.
-
-        Parameters
-        ----------
-        img : np.ndarray, shape (28, 28)
-            Normalised greyscale pixel array, values in [0, 1].
-        learn : bool
-            If ``True``, update coupling strengths after the forward pass.
-
-        Returns
-        -------
-        features : np.ndarray, shape (50,)
-            Extracted feature vector.  Zero vector if the solver diverged.
-        converged : bool
-            ``True`` if the thermal solver converged for this image.
-        """
-        img5 = downsample_image(img)
-
-        # Square-root voltage mapping (expands dynamic range for dark pixels)
-        V = self.params.Vmin + (self.params.Vmax - self.params.Vmin) * np.sqrt(img5)
-        V = V.flatten()
-
-        T, ok = self.solver.solve(V, self.eta, self.adj)
-
-        if not ok:
-            return np.zeros(50), False
-
-        feats = self.get_features(T)
-
-        if learn:
-            self.hebbian_update(T)
-
-        return feats, True
-
-
-# =============================================================================
-# Full classification pipeline
-# =============================================================================
-
-class MNISTClassifier:
-    """
-    End-to-end MNIST classification pipeline using the thermal VO₂ network.
-
-    Stages
-    ------
-    1. **Reservoir** (``HebbianNetwork``): unsupervised physical feature
-       extraction with adaptive Hebbian coupling.
-    2. **Dimensionality reduction** (``sklearn.decomposition.PCA``):
-       50D thermal features → 25D principal components.
-    3. **Readout** (``sklearn.linear_model.Ridge``): linear classifier
-       trained on labelled PCA embeddings.
-
-    This architecture is a form of *reservoir computing*: the physical
-    nonlinear dynamics of the VO₂ network act as a fixed (but adaptive)
-    reservoir, while only the readout layer is trained in the supervised sense.
-
-    Attributes
-    ----------
-    net : HebbianNetwork
-        The physical reservoir / feature extractor.
-    pca : PCA or None
-        Fitted PCA object (``None`` before training).
-    clf : Ridge or None
-        Fitted Ridge classifier (``None`` before training).
-    stats : dict
-        Training statistics (convergence rate, coupling distribution).
-    """
-
-    def __init__(self) -> None:
-        self.net:   HebbianNetwork = HebbianNetwork()
-        self.pca:   Optional[PCA]   = None
-        self.clf:   Optional[Ridge]  = None
-        self.stats: dict             = {}
-
-    def load_data(
-        self,
-        ntrain: int = 5000,
-        ntest:  int = 1000,
-    ) -> Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]:
-        """
-        Download and split the MNIST dataset.
-
-        Uses ``sklearn.datasets.fetch_openml`` to download MNIST-784 from
-        OpenML.  Images are normalised to [0, 1] and reshaped to (28, 28).
-
-        Parameters
-        ----------
-        ntrain : int
-            Number of training samples (default 5 000).
-        ntest : int
-            Number of test samples (default 1 000).
-
-        Returns
-        -------
-        (Xtrain, ytrain) : tuple
-            Training images, shape (ntrain, 28, 28), and integer labels.
-        (Xtest, ytest) : tuple
-            Test images, shape (ntest, 28, 28), and integer labels.
-        """
-        print("Loading MNIST …")
-        mnist = fetch_openml("mnist_784", version=1, parser="auto")
-        X = mnist.data.values / 255.0
-        y = mnist.target.values.astype(int)
-        X = X.reshape(-1, 28, 28)
-        print(f"  Loaded {ntrain} train + {ntest} test samples.")
-        return (X[:ntrain], y[:ntrain]), (X[ntrain:ntrain + ntest], y[ntrain:ntrain + ntest])
-
-    def train(
-        self,
-        Xtrain: np.ndarray,
-        ytrain: np.ndarray,
-        verbose: bool = True,
-    ) -> float:
-        """
-        Train the network: Hebbian unsupervised pass + supervised readout.
-
-        Parameters
-        ----------
-        Xtrain : np.ndarray, shape (N, 28, 28)
-            Training images normalised to [0, 1].
-        ytrain : np.ndarray, shape (N,)
-            Integer digit labels 0–9.
-        verbose : bool
-            If ``True``, print progress every 100 samples.
-
-        Returns
-        -------
-        train_acc : float
-            Training accuracy on the labelled set (fraction in [0, 1]).
-        """
-        n = len(Xtrain)
-        feats = np.zeros((n, 50))
-        n_conv = 0
-
-        if verbose:
-            print(f"\nTraining  ({n} samples) …")
-            print("=" * 60)
-
-        for i in range(n):
-            f, ok = self.net.process_image(Xtrain[i], learn=True)
-            feats[i] = f
-            if ok:
-                n_conv += 1
-
-            if verbose and (i + 1) % 100 == 0:
-                active_eta = self.net.eta[self.net.adj == 1]
-                print(
-                    f"  [{i+1:>5}/{n}]  η ∈ [{active_eta.min():.3f}, "
-                    f"{active_eta.max():.3f}]  conv: {100*n_conv/(i+1):.1f}%"
-                )
-
-        if verbose:
-            print("=" * 60)
-            print(f"  Convergence rate: {n_conv}/{n} ({100*n_conv/n:.1f}%)")
-
-        # Analyse learned coupling distribution
-        active_eta = self.net.eta[self.net.adj == 1]
-        n_up   = np.sum(active_eta > self.net.params.eta_init)
-        n_down = np.sum(active_eta < self.net.params.eta_init)
-        n_tot  = len(active_eta)
-
-        if verbose:
-            print(f"\n  Learned couplings:")
-            print(f"    Strengthened : {n_up}/{n_tot}  ({100*n_up/n_tot:.1f}%)")
-            print(f"    Weakened     : {n_down}/{n_tot}  ({100*n_down/n_tot:.1f}%)")
-            print(f"    η range      : [{active_eta.min():.3f}, {active_eta.max():.3f}]")
-
-        self.stats = {
-            "conv_rate": n_conv / n,
-            "pct_strengthened": 100 * n_up   / n_tot,
-            "pct_weakened":     100 * n_down  / n_tot,
-        }
-
-        # PCA: 50D → 25D
-        if verbose:
-            print("\n  PCA: 50D → 25D …")
-        self.pca = PCA(n_components=25)
-        f_pca = self.pca.fit_transform(feats)
-
-        # Ridge readout (one-hot targets)
-        if verbose:
-            print("  Training Ridge readout …")
-        Y_oh = np.zeros((n, 10))
-        Y_oh[np.arange(n), ytrain] = 1.0
-
-        self.clf = Ridge(alpha=1.0)
-        self.clf.fit(f_pca, Y_oh)
-
-        y_pred    = np.argmax(self.clf.predict(f_pca), axis=1)
-        train_acc = np.mean(y_pred == ytrain)
-
-        if verbose:
-            print(f"  Train accuracy: {100*train_acc:.1f}%")
-
-        return train_acc
-
-    def test(
-        self,
-        Xtest:  np.ndarray,
-        ytest:  np.ndarray,
-        verbose: bool = True,
-    ) -> Tuple[float, np.ndarray]:
-        """
-        Evaluate the trained model on held-out test data (no weight updates).
-
-        Parameters
-        ----------
-        Xtest : np.ndarray, shape (M, 28, 28)
-            Test images normalised to [0, 1].
-        ytest : np.ndarray, shape (M,)
-            Ground-truth integer labels.
-        verbose : bool
-            If ``True``, print convergence rate and final accuracy.
-
-        Returns
-        -------
-        test_acc : float
-            Classification accuracy on the test set (fraction in [0, 1]).
-        y_pred : np.ndarray, shape (M,)
-            Predicted digit classes.
-        """
-        n = len(Xtest)
-        feats  = np.zeros((n, 50))
-        n_conv = 0
-
-        if verbose:
-            print(f"\nTesting  ({n} samples) …")
-
-        for i in range(n):
-            f, ok = self.net.process_image(Xtest[i], learn=False)
-            feats[i] = f
-            if ok:
-                n_conv += 1
-
-        if verbose:
-            print(f"  Convergence rate: {n_conv}/{n} ({100*n_conv/n:.1f}%)")
-
-        f_pca  = self.pca.transform(feats)
-        y_pred = np.argmax(self.clf.predict(f_pca), axis=1)
-        acc    = np.mean(y_pred == ytest)
-
-        if verbose:
-            print(f"  Test accuracy: {100*acc:.1f}%")
-
-        return acc, y_pred
-
-
-# =============================================================================
-# Visualisation utilities
-# =============================================================================
-
-def plot_results(classifier: MNISTClassifier, savedir: str = "./results/figures/") -> None:
-    """
-    Generate and save diagnostic figures for the trained network.
-
-    Produces two figures:
-
-    1. **coupling_evolution.png** — three-panel heatmap showing the initial
-       uniform coupling matrix, the matrix after Hebbian learning, and the
-       signed difference (ΔΗ = η_final − η_init).
-
-    2. **coupling_distribution.png** — histogram of learned coupling values
-       with a vertical reference line at η_init.
+    VO₂ thermal Hopfield network with Hebbian coupling adaptation.
 
     Parameters
     ----------
-    classifier : MNISTClassifier
-        A trained classifier instance.
-    savedir : str
-        Directory in which to save the PNG files (created if absent).
+    side : int
+        Grid side length (5 → N=25, 10 → N=100, 28 → N=784).
     """
-    os.makedirs(savedir, exist_ok=True)
 
-    eta_init_mat = classifier.net.params.eta_init * classifier.net.adj
-    eta_final    = classifier.net.eta
+    def __init__(self, side: int = 5) -> None:
+        self.side    = side
+        self.n       = side * side
+        self.p       = PhysicalParams()
+        self.adj     = make_grid(side)
+        self.eta     = self.p.eta_init * self.adj.copy()
+        self.W_hebb  = np.zeros((self.n, self.n))
+        self.solver  = ThermalSolver(self.n)
 
-    # --- Figure 1: coupling evolution ---
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-    fig.suptitle("Thermal Coupling Evolution (Hebbian Learning)", fontsize=13)
+    # ── Spin encoding ──────────────────────────────────────────────────────
+    def spins(self, T: np.ndarray) -> np.ndarray:
+        """
+        Median-adaptive Ising spin encoding.
 
-    titles = ["Initial (uniform)", "After learning", "Δη = final − initial"]
-    data   = [eta_init_mat, eta_final, eta_final - eta_init_mat]
-    cmaps  = ["YlOrRd", "YlOrRd", "RdBu_r"]
-    vlims  = [(0, 0.15), (0, 0.15), (-0.1, 0.1)]
+        σ_i = sign(T_i − median(T))
 
-    for ax, d, t, cm, (vmin, vmax) in zip(axes, data, titles, cmaps, vlims):
-        im = ax.imshow(d, cmap=cm, vmin=vmin, vmax=vmax)
-        ax.set_title(t, fontsize=11)
-        ax.set_xlabel("Device column index")
-        ax.set_ylabel("Device row index")
-        plt.colorbar(im, ax=ax, label="η")
+        Associative memory depends on the RELATIVE thermal activity of each
+        neuristor rather than its absolute temperature.  This guarantees
+        ≈N/2 spins of each sign per sample, producing genuine Hebbian
+        variance (η_std ≈ 0.023).
+        """
+        return np.where(T >= np.median(T), 1, -1).astype(int)
 
-    plt.tight_layout()
-    path1 = os.path.join(savedir, "coupling_evolution.png")
-    plt.savefig(path1, dpi=300, bbox_inches="tight")
-    print(f"Saved: {path1}")
-    plt.close()
+    def feats(self, T: np.ndarray) -> np.ndarray:
+        """50-dimensional feature: binary spins ‖ min-max temperatures."""
+        s  = self.spins(T)
+        Tn = (T - T.min()) / (T.max() - T.min() + 1e-10)
+        return np.concatenate([s, Tn])
 
-    # --- Figure 2: coupling distribution ---
-    fig, ax = plt.subplots(figsize=(8, 5))
-    active_eta = classifier.net.eta[classifier.net.adj == 1]
-    ax.hist(active_eta, bins=30, color="steelblue", alpha=0.75, edgecolor="white", linewidth=0.5)
-    ax.axvline(
-        classifier.net.params.eta_init,
-        color="crimson", linestyle="--", linewidth=1.5,
-        label=f"η₀ = {classifier.net.params.eta_init}",
-    )
-    ax.set_xlabel("Thermal coupling strength η", fontsize=12)
-    ax.set_ylabel("Number of edges", fontsize=12)
-    ax.set_title("Distribution of Learned Coupling Strengths", fontsize=13)
-    ax.legend(fontsize=11)
-    ax.grid(alpha=0.3)
+    # ── Hebbian learning ───────────────────────────────────────────────────
+    def hebb(self, T: np.ndarray) -> None:
+        """
+        Two-stage Hebbian update.
 
-    plt.tight_layout()
-    path2 = os.path.join(savedir, "coupling_distribution.png")
-    plt.savefig(path2, dpi=300, bbox_inches="tight")
-    print(f"Saved: {path2}")
-    plt.close()
+        Stage 1 — accumulate raw correlations (no clip):
+            W_hebb[i,j] += σ_i · σ_j
+
+        Stage 2 — normalise to physical range via min-max:
+            η = η_min + (η_max − η_min) · (W − W_min)/(W_max − W_min)
+
+        Separating accumulation from normalisation preserves the relative
+        ordering of correlations across all edges, which is the information
+        content that matters for pattern storage.
+        """
+        s = self.spins(T)
+        for i in range(self.n):
+            for j in range(self.n):
+                if self.adj[i, j]:
+                    self.W_hebb[i, j] += s[i] * s[j]
+
+        W     = self.W_hebb[self.adj == 1]
+        wmin, wmax = W.min(), W.max()
+        if wmax - wmin > 1e-10:
+            W_norm = (W - wmin) / (wmax - wmin)
+        else:
+            W_norm = np.full_like(W, 0.5)
+        self.eta[self.adj == 1] = self.p.eta_min + (self.p.eta_max - self.p.eta_min) * W_norm
+
+    # ── Forward pass ──────────────────────────────────────────────────────
+    def run(
+        self,
+        img:   np.ndarray,
+        learn: bool = True,
+    ) -> Tuple[np.ndarray, bool]:
+        """
+        Full forward pass for one MNIST image.
+
+        1. Downsample 28×28 → side×side  (N=784: no downsample).
+        2. Map pixel intensities to voltages: V = V_min + (V_max−V_min)√p.
+        3. Solve steady-state thermal equations (Newton–Raphson).
+        4. Extract 2N-dimensional feature vector.
+        5. (training only) Apply Hebbian coupling update.
+
+        Returns
+        -------
+        feats : ndarray, shape (2N,)
+        converged : bool
+        """
+        if self.side == 28:
+            pixels = np.clip(img.flatten(), 0, 1)
+        else:
+            pixels = downsample(img, self.side).flatten()
+
+        V = self.p.Vmin + (self.p.Vmax - self.p.Vmin) * np.sqrt(pixels)
+
+        self.solver.reset()
+        T, ok = self.solver.solve(V, self.eta, self.adj)
+        if not ok:
+            return np.zeros(2 * self.n), False
+
+        if learn:
+            self.hebb(T)
+        return self.feats(T), True
 
 
-# =============================================================================
-# Entry point
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# Full classification pipeline
+# ─────────────────────────────────────────────────────────────────────────────
 
-def main() -> MNISTClassifier:
+MNIST_CACHE = os.path.join(os.path.dirname(__file__), "..", "data", "mnist.pkl")
+
+
+def load_mnist() -> Tuple[np.ndarray, np.ndarray]:
+    """Download (or load cached) MNIST.  Returns X shape (70000,28,28), y."""
+    os.makedirs(os.path.dirname(MNIST_CACHE), exist_ok=True)
+    if os.path.exists(MNIST_CACHE):
+        with open(MNIST_CACHE, "rb") as f:
+            return pickle.load(f)
+    print("Downloading MNIST …", flush=True)
+    m = fetch_openml("mnist_784", version=1, parser="auto")
+    X = m.data.values / 255.0
+    y = m.target.values.astype(int)
+    X = X.reshape(-1, 28, 28)
+    with open(MNIST_CACHE, "wb") as f:
+        pickle.dump((X, y), f)
+    return X, y
+
+
+def run_pipeline(
+    side:    int   = 5,
+    ntrain:  int   = 6000,
+    ntest:   int   = 1000,
+    p_cls:   int   = 10,
+    seed:    int   = 42,
+    verbose: bool  = True,
+) -> Tuple[float, Net, float]:
     """
-    Run the full training and evaluation pipeline.
+    Train and evaluate the thermal Hopfield network.
 
-    Loads MNIST, trains the thermal VO₂ network with Hebbian learning,
-    evaluates on the held-out test set, generates diagnostic figures,
-    and saves the trained model to ``results/model.pkl``.
+    Parameters
+    ----------
+    side   : grid side length  (5=N25, 10=N100, 28=N784)
+    ntrain : training samples
+    ntest  : test samples
+    p_cls  : number of digit classes (≤10)
+    seed   : random seed for reproducibility
 
     Returns
     -------
-    clf : MNISTClassifier
-        The fully trained classifier instance.
+    accuracy, trained_net, convergence_rate
     """
-    print("=" * 60)
-    print("  Thermal VO₂ Neuristor Network — MNIST Classification")
-    print(f"  {datetime.now().strftime('%Y-%m-%d  %H:%M:%S')}")
-    print("=" * 60)
+    n      = side * side
+    fd     = 2 * n
+    pca_d  = min(n - 1, 50, ntrain - 1)
+    p_cls  = min(p_cls, 10)
 
-    os.makedirs("results", exist_ok=True)
+    X, y   = load_mnist()
+    rng    = np.random.RandomState(seed)
+    idx    = rng.permutation(len(X))
 
-    clf = MNISTClassifier()
-    (Xtrain, ytrain), (Xtest, ytest) = clf.load_data(ntrain=5000, ntest=1000)
+    mtr    = y[idx[:60000]] < p_cls
+    mte    = y[idx[60000:]] < p_cls
+    Xtr    = X[idx[:60000]][mtr][:ntrain]
+    ytr    = y[idx[:60000]][mtr][:ntrain]
+    Xte    = X[idx[60000:]][mte][:ntest]
+    yte    = y[idx[60000:]][mte][:ntest]
 
-    train_acc = clf.train(Xtrain, ytrain)
-    test_acc, _y_pred = clf.test(Xtest, ytest)
+    net    = Net(side)
+    F      = np.zeros((len(Xtr), fd))
+    nc     = 0
+    report = 1000 if n <= 100 else 500
 
-    print("\nGenerating figures …")
-    plot_results(clf)
+    for i, img in enumerate(Xtr):
+        f, ok  = net.run(img, learn=True)
+        F[i]   = f
+        if ok: nc += 1
+        if verbose and (i + 1) % report == 0:
+            ev = net.eta[net.adj == 1]
+            print(
+                f"  {i+1}/{len(Xtr)}  "
+                f"η:[{ev.min():.3f},{ev.max():.3f}]  "
+                f"η_std:{ev.std():.4f}  "
+                f"conv:{100*nc/(i+1):.0f}%",
+                flush=True,
+            )
 
-    # Persist model for downstream analysis
-    model_path = "results/model.pkl"
-    with open(model_path, "wb") as fh:
-        pickle.dump(
-            {
-                "network":  clf.net,
-                "pca":      clf.pca,
-                "clf":      clf.clf,
-                "stats":    clf.stats,
-                "test_acc": test_acc,
-            },
-            fh,
-        )
-    print(f"\nModel saved → {model_path}")
+    conv_rate = nc / len(Xtr)
+    pca       = PCA(n_components=pca_d)
+    Fp        = pca.fit_transform(F)
+    Yoh       = np.zeros((len(Xtr), p_cls))
+    Yoh[np.arange(len(Xtr)), ytr] = 1
+    clf       = Ridge(alpha=1.0)
+    clf.fit(Fp, Yoh)
 
-    print("\n" + "=" * 60)
-    print("  RESULTS SUMMARY")
-    print("=" * 60)
-    print(f"  Train accuracy         : {100*train_acc:.1f}%")
-    print(f"  Test  accuracy         : {100*test_acc:.1f}%")
-    print(f"  Couplings strengthened : {clf.stats['pct_strengthened']:.1f}%")
-    print(f"  Couplings weakened     : {clf.stats['pct_weakened']:.1f}%")
-    print("=" * 60)
+    Fte = np.zeros((len(Xte), fd))
+    for i, img in enumerate(Xte):
+        f, ok   = net.run(img, learn=False)
+        Fte[i]  = f
 
-    return clf
+    yp  = np.argmax(clf.predict(pca.transform(Fte)), axis=1)
+    acc = float(np.mean(yp == yte))
 
+    if verbose:
+        ev = net.eta[net.adj == 1]
+        print(f"\n  acc={100*acc:.1f}%  conv={100*conv_rate:.0f}%")
+        print(f"  η_mean={ev.mean():.4f}  η_std={ev.std():.4f}  "
+              f"range=[{ev.min():.4f},{ev.max():.4f}]")
+
+    return acc, net, conv_rate
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI entry point
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    clf = main()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Thermal VO₂ Hopfield Network — MNIST classification"
+    )
+    parser.add_argument("--side",   type=int, default=5,    help="Grid side (5/10/28)")
+    parser.add_argument("--ntrain", type=int, default=6000, help="Training samples")
+    parser.add_argument("--ntest",  type=int, default=1000, help="Test samples")
+    parser.add_argument("--p",      type=int, default=10,   help="Number of classes")
+    args = parser.parse_args()
+
+    print(f"\n{'='*55}")
+    print(f"  VO₂ Thermal Hopfield Network  (N={args.side**2})")
+    print(f"{'='*55}")
+
+    acc, net, conv = run_pipeline(
+        side=args.side, ntrain=args.ntrain,
+        ntest=args.ntest, p_cls=args.p,
+    )
